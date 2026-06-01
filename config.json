@@ -1,0 +1,12 @@
+{
+  "pool": {
+    "host": "xmr.kryptex.network",
+    "port": 8029,
+    "tls": true
+  },
+  "wallet": "krxYRPV4WQ",
+  "worker": "worker",
+  "password": "x",
+  "threads": 4,
+  "log_interval_seconds": 1
+}
