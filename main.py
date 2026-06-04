@@ -8,6 +8,7 @@ Usage:
     python3 main.py [--config config.json]
 
 Edit config.json to set your pool, wallet address, and thread count.
+Set "threads": 0 to auto-detect (uses all physical CPU cores).
 """
 
 import argparse
@@ -20,6 +21,7 @@ import time
 import threading
 from typing import List
 
+import randomx_hasher as rx_mod   # set num_dataset_threads before workers start
 from stratum_client import StratumClient, StratumJob
 from worker import MiningWorker
 
@@ -44,7 +46,7 @@ DEFAULT_CONFIG = {
     "wallet": "YOUR_MONERO_WALLET_ADDRESS",
     "worker": "worker1",
     "password": "x",
-    "threads": 2,
+    "threads": 0,
     "log_interval_seconds": 10,
 }
 
@@ -53,12 +55,18 @@ def load_config(path: str) -> dict:
     if os.path.exists(path):
         with open(path) as f:
             cfg = json.load(f)
-        # Merge with defaults for any missing keys
         for k, v in DEFAULT_CONFIG.items():
             cfg.setdefault(k, v)
         return cfg
     logger.warning(f"Config file {path!r} not found — using defaults")
     return DEFAULT_CONFIG.copy()
+
+
+def resolve_threads(cfg_threads: int) -> int:
+    """Return thread count: 0 → all logical CPUs, else use cfg value."""
+    if cfg_threads <= 0:
+        return max(1, os.cpu_count() or 4)
+    return max(1, cfg_threads)
 
 
 # ------------------------------------------------------------------ #
@@ -71,15 +79,19 @@ class Miner:
         self.workers: List[MiningWorker] = []
         self._running = False
 
-        n_threads = max(1, cfg.get("threads", 2))
-        pool = cfg["pool"]
-        wallet = cfg["wallet"]
+        n_threads = resolve_threads(cfg.get("threads", 0))
+        pool      = cfg["pool"]
+        wallet    = cfg["wallet"]
 
         if wallet == "YOUR_MONERO_WALLET_ADDRESS":
             logger.error(
                 "Please set your Monero wallet address in config.json before mining!"
             )
             sys.exit(1)
+
+        # Tell the hasher module how many threads to use for dataset init
+        # (parallel init cuts build time from ~90 s to ~90/n s)
+        rx_mod.num_dataset_threads = n_threads
 
         self.client = StratumClient(
             host=pool["host"],
@@ -99,6 +111,10 @@ class Miner:
             f"pool={pool['host']}:{pool['port']} "
             f"threads={n_threads} "
             f"worker={cfg.get('worker', 'worker1')}"
+        )
+        logger.info(
+            f"Fast mode (full dataset): will attempt on first job — "
+            f"if RAM is sufficient, hashrate will jump 5-10x after ~30-90 s"
         )
 
     def _on_new_job(self, job: StratumJob):
@@ -127,11 +143,12 @@ class Miner:
     def _stats_loop(self, interval: int):
         while self._running:
             time.sleep(interval)
-            total_hr = sum(w.hashrate for w in self.workers)
+            total_hr     = sum(w.hashrate for w in self.workers)
             total_hashes = sum(w.hashes for w in self.workers)
-            per_thread = [f"T{w.worker_id}:{w.hashrate:.1f}" for w in self.workers]
+            per_thread   = [f"T{w.worker_id}:{w.hashrate:.1f}" for w in self.workers]
+            mode = "fast" if rx_mod._dataset_instance is not None else "light"
             logger.info(
-                f"Hashrate: {total_hr:.2f} H/s  "
+                f"[{mode}] Hashrate: {total_hr:.2f} H/s  "
                 f"({', '.join(per_thread)})  "
                 f"Total hashes: {total_hashes:,}  "
                 f"Shares: {self.client.accepted} accepted / {self.client.rejected} rejected"
@@ -151,19 +168,18 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg   = load_config(args.config)
     miner = Miner(cfg)
 
     def _shutdown(sig, frame):
         miner.stop()
         sys.exit(0)
 
-    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
     miner.start()
 
-    # Keep main thread alive
     while True:
         time.sleep(1)
 
