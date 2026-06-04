@@ -1,45 +1,46 @@
 """
 Mining worker — one thread per CPU core.
 
-Each worker:
-  1. Keeps its own RandomX VM (cache ~256 MB in light mode)
-  2. Iterates nonces from its dedicated stride
-  3. Submits shares via the shared StratumClient
+Fast path: calls rx_batch_mine() in librxbatch.so — the entire nonce loop
+runs in C with the GIL released, giving true multi-core parallelism and zero
+per-hash Python overhead.
 
-Nonce format: submitted as raw little-endian bytes hex (e.g. nonce 0xAD0
-is stored as d0 0a 00 00 in the blob and submitted as "d00a0000").
-This matches the XMRig convention that all major Monero pools expect.
+Fallback: pipelined hash_first/hash_next/hash_last if librxbatch.so is absent.
+
+Nonce format: raw little-endian bytes hex (XMRig convention).
 """
 
+import ctypes
 import struct
 import threading
 import time
 import logging
 from typing import Optional
 
-from randomx_hasher import RandomXVM
+from randomx_hasher import RandomXVM, get_batch_lib
 from stratum_client import StratumClient, StratumJob
 
 logger = logging.getLogger(__name__)
 
-_STALE_CHECK_INTERVAL = 64  # check for new job every N hashes
+_NONCE_OFF  = 39     # byte offset of the 4-byte nonce in a Monero blob
+_BATCH_SIZE = 512    # hashes per C call — balances job-update latency vs overhead
 
 
 class MiningWorker(threading.Thread):
 
     def __init__(self, worker_id: int, num_workers: int, client: StratumClient):
         super().__init__(daemon=True, name=f"worker-{worker_id}")
-        self.worker_id = worker_id
+        self.worker_id  = worker_id
         self.num_workers = num_workers
-        self.client = client
+        self.client     = client
 
-        self._running = False
+        self._running   = False
         self._job: Optional[StratumJob] = None
         self._job_event = threading.Event()
-        self._job_lock = threading.Lock()
+        self._job_lock  = threading.Lock()
 
-        self.hashes: int = 0
-        self._start_time: float = 0.0
+        self.hashes: int    = 0
+        self._start_time: float = 0.0      # set on first hash (excludes build wait)
 
     def set_job(self, job: StratumJob):
         with self._job_lock:
@@ -48,9 +49,16 @@ class MiningWorker(threading.Thread):
 
     def run(self):
         self._running = True
-        self._start_time = time.monotonic()
-        vm = RandomXVM(light_mode=True)
-        logger.debug(f"Worker {self.worker_id} started")
+        vm = RandomXVM()
+        batch_lib = get_batch_lib()
+
+        if batch_lib:
+            logger.info(f"Worker {self.worker_id}: using native C batch miner")
+        else:
+            logger.warning(
+                f"Worker {self.worker_id}: librxbatch.so not found — "
+                "using Python pipelined fallback (run build_randomx.sh to enable C batch mode)"
+            )
 
         while self._running:
             self._job_event.wait(timeout=2)
@@ -62,50 +70,132 @@ class MiningWorker(threading.Thread):
             if job is None:
                 continue
 
-            self._mine(vm, job)
+            if batch_lib:
+                self._mine_batch(vm, job, batch_lib)
+            else:
+                self._mine_pipeline(vm, job)
 
         vm.close()
 
-    def _mine(self, vm: RandomXVM, job: StratumJob):
+    # ------------------------------------------------------------------ #
+    # Fast path: native C batch loop                                       #
+    # ------------------------------------------------------------------ #
+
+    def _mine_batch(self, vm: RandomXVM, job: StratumJob, lib):
         try:
             vm.ensure_seed(job.seed_hash)
         except Exception as exc:
             logger.error(f"Worker {self.worker_id} VM init failed: {exc}")
             return
 
-        blob = bytearray(job.blob)
-        nonce_offset = 39   # 4-byte LE nonce position in Monero blob
+        blob   = bytes(job.blob)                  # immutable — passed directly to C
+        target = job.target_int                   # 64-bit expanded target
         stride = self.num_workers
-        nonce = self.worker_id & 0xFFFFFFFF
-        batch = 0
+        nonce  = ctypes.c_uint32(self.worker_id)
+
+        out_nonce = ctypes.c_uint32(0xFFFFFFFF)
+        out_hash  = ctypes.create_string_buffer(32)
 
         while self._running:
-            # Check for new job every _STALE_CHECK_INTERVAL hashes
-            if batch >= _STALE_CHECK_INTERVAL:
+            # Check for a new job before each batch
+            with self._job_lock:
+                if self._job is not job:
+                    return
+
+            n_done = lib.rx_batch_mine(
+                vm._vm,                            # randomx_vm*
+                blob,                              # const uint8_t* blob_template
+                len(blob),                         # blob_len
+                _NONCE_OFF,                        # nonce_off
+                nonce,                             # nonce_start
+                ctypes.c_uint32(stride),           # nonce_stride
+                _BATCH_SIZE,                       # batch_size
+                ctypes.c_uint64(target),           # target
+                ctypes.byref(out_nonce),           # *out_nonce
+                out_hash,                          # out_hash[32]
+            )
+            if not self._start_time:
+                self._start_time = time.monotonic()
+            self.hashes += n_done
+
+            if out_nonce.value != 0xFFFFFFFF:
+                winning_nonce = out_nonce.value
+                h = bytes(out_hash)
+                self._submit(job, winning_nonce, h)
+                out_nonce.value = 0xFFFFFFFF       # reset for next batch
+
+            # Advance nonce past the batch
+            nonce = ctypes.c_uint32(nonce.value + stride * _BATCH_SIZE)
+
+    # ------------------------------------------------------------------ #
+    # Fallback: Python pipelined loop                                      #
+    # ------------------------------------------------------------------ #
+
+    _STALE_CHECK = 64
+
+    def _mine_pipeline(self, vm: RandomXVM, job: StratumJob):
+        try:
+            vm.ensure_seed(job.seed_hash)
+        except Exception as exc:
+            logger.error(f"Worker {self.worker_id} VM init failed: {exc}")
+            return
+
+        blob      = bytearray(job.blob)
+        stride    = self.num_workers
+        nonce     = self.worker_id & 0xFFFFFFFF
+        pack_into = struct.pack_into
+
+        pack_into("<I", blob, _NONCE_OFF, nonce)
+        vm.hash_first(bytes(blob))
+        prev_nonce = nonce
+        nonce      = (nonce + stride) & 0xFFFFFFFF
+        batch      = 0
+
+        meets_target = job.meets_target
+        hash_next    = vm.hash_next
+        hash_last    = vm.hash_last
+
+        while self._running:
+            if batch >= self._STALE_CHECK:
                 batch = 0
                 with self._job_lock:
                     if self._job is not job:
-                        return  # stale — outer loop will pick up new job
+                        h = hash_last()
+                        self.hashes += 1
+                        if meets_target(h):
+                            self._submit(job, prev_nonce, h)
+                        return
 
-            # Write nonce as little-endian into blob
-            struct.pack_into("<I", blob, nonce_offset, nonce)
-
-            h = vm.hash(bytes(blob))
+            pack_into("<I", blob, _NONCE_OFF, nonce)
+            h = hash_next(bytes(blob))
+            if not self._start_time:
+                self._start_time = time.monotonic()
             self.hashes += 1
             batch += 1
 
-            if job.meets_target(h):
-                # Submit nonce as raw LE bytes hex — this is what the pool
-                # writes directly into the blob template when verifying.
-                nonce_hex = struct.pack("<I", nonce).hex()
-                result_hex = h.hex()
-                logger.info(
-                    f"Worker {self.worker_id} found share! "
-                    f"nonce={nonce_hex} hash={result_hex[:16]}…"
-                )
-                self.client.submit_share(job.job_id, nonce_hex, result_hex)
+            if meets_target(h):
+                self._submit(job, prev_nonce, h)
 
-            nonce = (nonce + stride) & 0xFFFFFFFF
+            prev_nonce = nonce
+            nonce      = (nonce + stride) & 0xFFFFFFFF
+
+        h = hash_last()
+        self.hashes += 1
+        if meets_target(h):
+            self._submit(job, prev_nonce, h)
+
+    # ------------------------------------------------------------------ #
+    # Shared helpers                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _submit(self, job: StratumJob, nonce: int, h: bytes):
+        nonce_hex  = struct.pack("<I", nonce).hex()
+        result_hex = h.hex()
+        logger.info(
+            f"Worker {self.worker_id} found share! "
+            f"nonce={nonce_hex} hash={result_hex[:16]}…"
+        )
+        self.client.submit_share(job.job_id, nonce_hex, result_hex)
 
     def stop(self):
         self._running = False
