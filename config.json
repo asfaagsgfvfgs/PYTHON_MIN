@@ -7,6 +7,6 @@
   "wallet": "46qfKvhZjvtZPQuSryhfnJ5pS4xkQosv2C6qzZ613vLaPa6vwZ1JgrV7HAxE4wMDUUYSzAyBBZGmNPfbPDrUegGvC1UtEdH",
   "worker": "worker",
   "password": "x",
-  "threads": 8,
+  "threads": 4,
   "log_interval_seconds": 1
 }
