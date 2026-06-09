@@ -1,10 +1,10 @@
 {
   "pool": {
-    "host": "pool.hashvault.pro",
-    "port": 443,
+    "host": "xmr.kryptex.network",
+    "port": 7029,
     "tls": true
   },
-  "wallet": "46qfKvhZjvtZPQuSryhfnJ5pS4xkQosv2C6qzZ613vLaPa6vwZ1JgrV7HAxE4wMDUUYSzAyBBZGmNPfbPDrUegGvC1UtEdH",
+  "wallet": "krxYRPV4WQ",
   "worker": "worker",
   "password": "x",
   "threads": 4,
