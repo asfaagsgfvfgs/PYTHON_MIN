@@ -7,6 +7,6 @@
   "wallet": "krxYRPV4WQ",
   "worker": "worker",
   "password": "x",
-  "threads": 4,
+  "threads": 2,
   "log_interval_seconds": 1
 }
